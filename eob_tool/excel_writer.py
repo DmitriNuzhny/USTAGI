@@ -170,11 +170,15 @@ def _fill_estimator(ws: Worksheet, mapping: Dict[str, Any], result_obj: Any, mod
 
     # Set start_year for table
     dps = summary.get("date_placed_in_service")
-    if hasattr(dps, "year"):
-        start_year = int(dps.year)
+    dps = "" if dps is None else str(dps).strip()
+
+    if dps.lower() in ("none", "null", "nan", ""):
+        dps = ""
+
+    if len(dps) >= 4 and dps[:4].isdigit():
+        start_year = int(dps[:4])
     else:
-        # ISO date string "2021-01-01" -> 2021
-        start_year = int(str(dps)[:4]) if dps else min(yearly.keys()) if yearly else 2021
+        start_year = min(yearly.keys()) if yearly else 2021
 
     # Set n_years to fill up to 2052
     last_year = 2052
