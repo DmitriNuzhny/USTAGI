@@ -186,11 +186,27 @@ def _fill_estimator(ws: Worksheet, mapping: Dict[str, Any], result_obj: Any, mod
         _fill_table(ws, mapping["table"], yearly)
 
 
+def _clear_excel_errors(wb) -> None:
+    """
+    Clears cells that contain broken formulas like #REF! (and optionally #VALUE!),
+    so the delivered workbook doesn't show errors when we're not populating those sections.
+    """
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if isinstance(v, str) and ("#REF!" in v or "#VALUE!" in v):
+                    cell.value = None
+
+
 def write_residential_workbook(result: Any, out_path: Path | str) -> None:
     out_path = Path(out_path)
     wb = load_workbook(RES_TEMPLATE)
     ws = wb.active  # single sheet
     _fill_estimator(ws, RES_MAP, result, mode="residential")
+
+    _clear_excel_errors(wb)   # <-- add this
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
 
@@ -200,5 +216,8 @@ def write_commercial_workbook(result: Any, out_path: Path | str) -> None:
     wb = load_workbook(COM_TEMPLATE)
     ws = wb.active  # single sheet
     _fill_estimator(ws, COM_MAP, result, mode="commercial")
+
+    _clear_excel_errors(wb)   # <-- add this
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)

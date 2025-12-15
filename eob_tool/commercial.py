@@ -177,7 +177,7 @@ def compute_commercial(inputs: Dict[str, Any], guidelines_df: pd.DataFrame, toda
         except Exception:
             study_year = None
 
-    lookback_active = (in_service is not None) or (study_year is not None)
+    lookback_active = (in_service is not None) and (study_year is not None)
 
     if not lookback_active:
         years_in_service = 0
