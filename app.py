@@ -1,15 +1,12 @@
-import io
-import mimetypes
 import os
 import json
+import time
 import logging
-from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from openpyxl import Workbook
 
 # -----------------------
 # Setup
@@ -21,10 +18,15 @@ log = logging.getLogger("monday-export-eob")
 
 app = FastAPI()
 
+# Simple in-memory idempotency to ignore repeated deliveries of the same action
+# (good enough for local dev; swap to Redis if you deploy multiple workers)
+_seen_actions: dict[str, float] = {}
+_SEEN_TTL_SECONDS = 60 * 60  # 1 hour
 
-def _env(name: str, required: bool = True) -> str:
+
+def _env(name: str) -> str:
     val = os.getenv(name, "").strip()
-    if required and not val:
+    if not val:
         raise RuntimeError(f"{name} missing/invalid")
     return val
 
@@ -37,26 +39,21 @@ def _safe_json(obj) -> str:
 
 
 def _find_item_id(payload: dict) -> int | None:
-    """
-    monday app events payload shapes vary.
-    Try a few known paths, then do a recursive search for 'itemId'/'item_id'.
-    """
-    # Common candidates
+    # Most common monday payload paths for app actions
     candidates = [
-        ("event", "itemId"),
-        ("event", "item_id"),
+        ("payload", "inputFields", "itemId"),
+        ("payload", "inboundFieldValues", "itemId"),
         ("payload", "itemId"),
-        ("payload", "item_id"),
+        ("event", "itemId"),
         ("data", "itemId"),
-        ("data", "item_id"),
     ]
 
     for path in candidates:
         cur = payload
         ok = True
-        for key in path:
-            if isinstance(cur, dict) and key in cur:
-                cur = cur[key]
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
             else:
                 ok = False
                 break
@@ -66,12 +63,11 @@ def _find_item_id(payload: dict) -> int | None:
             except Exception:
                 pass
 
-    # Recursive search
+    # Recursive fallback
     def walk(x):
         if isinstance(x, dict):
             for k, v in x.items():
-                lk = str(k).lower()
-                if lk in ("itemid", "item_id"):
+                if str(k).lower() in ("itemid", "item_id"):
                     yield v
                 yield from walk(v)
         elif isinstance(x, list):
@@ -87,20 +83,11 @@ def _find_item_id(payload: dict) -> int | None:
     return None
 
 
-def _make_test_excel_bytes(item_id: int) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "EOB Export"
-
-    ws["A1"] = "Hello from Export EOB"
-    ws["A2"] = "Item ID"
-    ws["B2"] = item_id
-    ws["A3"] = "Generated at"
-    ws["B3"] = datetime.now().isoformat(timespec="seconds")
-
-    bio = io.BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
+def _read_sample_file(path: str) -> tuple[bytes, str]:
+    if not os.path.isfile(path):
+        raise RuntimeError(f"Sample file not found: {path}")
+    with open(path, "rb") as f:
+        return f.read(), os.path.basename(path)
 
 
 def _monday_upload_file_to_column(
@@ -111,37 +98,30 @@ def _monday_upload_file_to_column(
     filename: str,
 ) -> dict:
     """
-    monday file upload format for /v2/file:
-      - multipart fields:
-          query: 'mutation ($file: File!) { add_file_to_column(item_id: X, column_id: "Y", file: $file) { id } }'
-          map:  '{"image":"variables.file"}'
-          image: <file>
+    monday upload format for https://api.monday.com/v2/file
+    multipart fields: query, map, image
     """
     url = "https://api.monday.com/v2/file"
 
-    # Put item_id + column_id directly in the query; only variable is $file
+    # monday's /v2/file expects item_id/column_id in the query; only $file is a variable
     query = (
         'mutation ($file: File!) { '
         f'add_file_to_column(item_id: {int(item_id)}, column_id: "{column_id}", file: $file) '
-        '{ id } }'
+        "{ id } }"
     )
-
-    # monday expects a JSON string mapping the file field name -> variables.file
-    map_field = {"image": "variables.file"}
-
-    content_type, _ = mimetypes.guess_type(filename)
-    if not content_type:
-        content_type = "application/octet-stream"
-
-    headers = {"Authorization": api_token}  # don't set Content-Type manually
 
     files = {
         "query": (None, query),
-        "map": (None, json.dumps(map_field)),
-        "image": (filename, file_bytes, content_type),
+        "map": (None, json.dumps({"image": "variables.file"})),
+        "image": (filename, file_bytes),
     }
 
-    resp = requests.post(url, headers=headers, files=files, timeout=60)
+    resp = requests.post(
+        url,
+        headers={"Authorization": api_token},  # don't set Content-Type manually
+        files=files,
+        timeout=60,
+    )
 
     try:
         payload = resp.json()
@@ -157,6 +137,27 @@ def _monday_upload_file_to_column(
     return payload
 
 
+def _get_action_uuid(body: dict) -> str | None:
+    try:
+        return str(body.get("runtimeMetadata", {}).get("actionUuid") or "").strip() or None
+    except Exception:
+        return None
+
+
+def _seen_action(action_uuid: str) -> bool:
+    now = time.time()
+    # prune old
+    for k, ts in list(_seen_actions.items()):
+        if now - ts > _SEEN_TTL_SECONDS:
+            _seen_actions.pop(k, None)
+
+    if action_uuid in _seen_actions:
+        return True
+
+    _seen_actions[action_uuid] = now
+    return False
+
+
 # -----------------------
 # Routes
 # -----------------------
@@ -165,57 +166,56 @@ def health():
     return {"ok": True}
 
 
-@app.post("/monday/subscribe")
-async def monday_subscribe(request: Request):
-    body = await request.json()
-    log.info(f"SUBSCRIBE: {_safe_json(body)}")
-    # For app events / automations, returning 200 is sufficient.
-    return JSONResponse({"ok": True})
-
-
-@app.post("/monday/unsubscribe")
-async def monday_unsubscribe(request: Request):
-    body = await request.json()
-    log.info(f"UNSUBSCRIBE: {_safe_json(body)}")
-    return JSONResponse({"ok": True})
-
-
 @app.post("/monday/webhook/export-eob")
 async def export_eob_webhook(request: Request):
-    """
-    Called when the automation/button triggers.
-    Action: upload a test xlsx to the triggering item, into the file column you specify.
-    """
     body = await request.json()
     log.info(f"EXPORT-EOB WEBHOOK: {_safe_json(body)}")
 
-    # Required config
-    file_column_id = _env("MONDAY_FILE_COLUMN_ID")  # e.g. "files" or your file column id
-    # (Optional) use a stable name for testing
-    filename = os.getenv("TEST_EXPORT_FILENAME", "export_eob_test.xlsx").strip() or "export_eob_test.xlsx"
+    action_uuid = _get_action_uuid(body)
+    if action_uuid and _seen_action(action_uuid):
+        # Already processed this exact action delivery
+        return JSONResponse(status_code=200, content={"ok": True, "deduped": True, "actionUuid": action_uuid})
 
     item_id = _find_item_id(body)
     if not item_id:
-        # Permanent misconfig: return 400 to indicate bad request
-        log.error("Could not find itemId in webhook payload. No upload performed.")
+        # Permanent bad request: stop retries
         return JSONResponse(status_code=400, content={"error": "missing_item_id"})
 
-    # Create a test Excel and upload
     try:
-        excel_bytes = _make_test_excel_bytes(item_id=item_id)
+        api_token = _env("MONDAY_API_TOKEN")
+        file_column_id = _env("MONDAY_FILE_COLUMN_ID")
+        sample_path = _env("SAMPLE_FILE_PATH")
+
+        file_bytes, filename = _read_sample_file(sample_path)
+
         upload_result = _monday_upload_file_to_column(
-            api_token=_env("MONDAY_API_TOKEN"),
+            api_token=api_token,
             item_id=item_id,
             column_id=file_column_id,
-            file_bytes=excel_bytes,
+            file_bytes=file_bytes,
             filename=filename,
         )
-        log.info(f"Uploaded file to item {item_id} column {file_column_id}: {_safe_json(upload_result)}")
-        return JSONResponse({"ok": True, "uploaded": True, "itemId": item_id})
+
+        log.info(f"Uploaded sample '{filename}' to item {item_id} column {file_column_id}")
+        return JSONResponse(
+            status_code=200,
+            content={"ok": True, "uploaded": True, "itemId": item_id, "filename": filename, "actionUuid": action_uuid},
+        )
+
+    except RuntimeError as e:
+        # Treat as permanent (config/sample/monday response): stop monday retry storms
+        log.exception(f"Export/upload failed: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "uploaded": False, "itemId": item_id, "actionUuid": action_uuid, "error": str(e)},
+        )
     except Exception as e:
-        # Return 200 to avoid aggressive retries while you're iterating (you can change to 500 later if you want).
-        log.exception(f"Upload failed: {e}")
-        return JSONResponse({"ok": True, "uploaded": False, "itemId": item_id, "error": str(e)})
+        # Unexpected: you may want retries while debugging true transient issues
+        log.exception(f"Unexpected failure: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "uploaded": False, "itemId": item_id, "actionUuid": action_uuid, "error": str(e)},
+        )
 
 
 if __name__ == "__main__":
