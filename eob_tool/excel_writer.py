@@ -6,6 +6,9 @@ from typing import Any, Dict, Optional
 
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.drawing.image import Image
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+from openpyxl.drawing.xdr import XDRPositiveSize2D
 
 
 RES_TEMPLATE = Path("templates") / "estimator_residential.xlsx"
@@ -29,8 +32,7 @@ RES_MAP = {
     "estimated_addl_depr": "G22",
     # The “tax savings” for the additional depreciation is usually the next line.
     # If it’s not, adjust this to match the template.
-    "tax_savings_addl": "G23",
-
+    "tax_savings_addl": "G23",    "tier": "G21",
     "table": {
         "start_row": 27,
         "n_years": 29,          # 2021–2049 (adjust if your template has more/less)
@@ -73,6 +75,55 @@ COM_MAP = {
 }
 
 
+EMU_PER_PIXEL = 9525
+
+def ensure_logo_exact(ws, logo_path: str = "templates/ustagi_logo.png") -> None:
+    """
+    Insert logo with exact placement measured from the template.
+    Template anchor readout:
+      TwoCellAnchor
+      from: col=3,row=0,colOff=647700,rowOff=0
+      size: 600x264 px
+    """
+    p = Path(logo_path)
+    if not p.exists():
+        return
+
+    # Prevent duplicates
+    try:
+        ws._images = []
+    except Exception:
+        pass
+
+    img = Image(str(p))
+
+    # --- Exact placement from your template ---
+    FROM_COL = 3               # 0-based -> D
+    FROM_ROW = 0               # 0-based -> row 1
+    COL_OFF_EMU = 647700       # = 68 px
+    ROW_OFF_EMU = 0
+    WIDTH_PX = 262
+    HEIGHT_PX = 115
+    # -----------------------------------------
+
+    marker = AnchorMarker(
+        col=FROM_COL,
+        colOff=COL_OFF_EMU,
+        row=FROM_ROW,
+        rowOff=ROW_OFF_EMU,
+    )
+
+    img.anchor = OneCellAnchor(
+        _from=marker,
+        ext=XDRPositiveSize2D(
+            cx=WIDTH_PX * EMU_PER_PIXEL,
+            cy=HEIGHT_PX * EMU_PER_PIXEL,
+        ),
+    )
+
+    ws.add_image(img)
+
+
 def _as_dict(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, dict):
         return obj
@@ -101,6 +152,14 @@ def _fill_table(ws: Worksheet, cfg: Dict[str, Any], yearly: Dict[int, Dict[str, 
     cwith = int(cfg["col_with_css"])       # G=7
     cwithout = int(cfg["col_without_css"]) # H=8
 
+    # Initialize sums
+    sum_5yr = 0.0
+    sum_7yr = 0.0
+    sum_15yr = 0.0
+    sum_long = 0.0
+    sum_with = 0.0
+    sum_without = 0.0
+
     # Write literal years + values row-by-row
     for i in range(n_years):
         year = start_year + i
@@ -109,12 +168,36 @@ def _fill_table(ws: Worksheet, cfg: Dict[str, Any], yearly: Dict[int, Dict[str, 
         ws.cell(r, col_year).value = year
 
         row = yearly.get(year, {})
-        ws.cell(r, c5).value = row.get("5yr", 0)
-        ws.cell(r, c7).value = row.get("7yr", 0)
-        ws.cell(r, c15).value = row.get("15yr", 0)
-        ws.cell(r, clong).value = row.get("long", 0)
-        ws.cell(r, cwith).value = row.get("with_css", 0)
-        ws.cell(r, cwithout).value = row.get("without_css", 0)
+        val_5yr = row.get("5yr", 0.0) or 0.0
+        val_7yr = row.get("7yr", 0.0) or 0.0
+        val_15yr = row.get("15yr", 0.0) or 0.0
+        val_long = row.get("long", 0.0) or 0.0
+        val_with = row.get("with_css", 0.0) or 0.0
+        val_without = row.get("without_css", 0.0) or 0.0
+
+        ws.cell(r, c5).value = val_5yr
+        ws.cell(r, c7).value = val_7yr
+        ws.cell(r, c15).value = val_15yr
+        ws.cell(r, clong).value = val_long
+        ws.cell(r, cwith).value = val_with
+        ws.cell(r, cwithout).value = val_without
+
+        sum_5yr += val_5yr
+        sum_7yr += val_7yr
+        sum_15yr += val_15yr
+        sum_long += val_long
+        sum_with += val_with
+        sum_without += val_without
+
+    # Add totals row
+    totals_row = start_row + n_years
+    ws.cell(totals_row, col_year).value = "Total"
+    ws.cell(totals_row, c5).value = sum_5yr
+    ws.cell(totals_row, c7).value = sum_7yr
+    ws.cell(totals_row, c15).value = sum_15yr
+    ws.cell(totals_row, clong).value = sum_long
+    ws.cell(totals_row, cwith).value = sum_with
+    ws.cell(totals_row, cwithout).value = sum_without
 
 
 
@@ -156,8 +239,8 @@ def _fill_estimator(ws: Worksheet, mapping: Dict[str, Any], result_obj: Any, mod
     # Land allocation: allow either text, amount, or both
     if "land_allocation_text" in mapping and summary.get("land_allocation_text") is not None:
         _ws_set(ws, mapping["land_allocation_text"], summary.get("land_allocation_text"))
-    if "land_allocation_amount" in mapping and summary.get("land_allocation_amount") is not None:
-        _ws_set(ws, mapping["land_allocation_amount"], summary.get("land_allocation_amount"))
+    if "land_allocation_amount" in mapping:
+        _ws_set(ws, mapping["land_allocation_amount"], summary.get("land_allocation_amount", ""))
 
     _ws_set(ws, mapping["building_basis"], summary.get("building_basis"))
     _ws_set(ws, mapping["improvements_included"], summary.get("improvements_included"))
@@ -167,6 +250,9 @@ def _fill_estimator(ws: Worksheet, mapping: Dict[str, Any], result_obj: Any, mod
     _ws_set(ws, mapping["tax_savings_total"], summary.get("tax_savings_40pct_total_accel"))
     _ws_set(ws, mapping["estimated_addl_depr"], summary.get("estimated_additional_depr"))
     _ws_set(ws, mapping["tax_savings_addl"], summary.get("tax_savings_40pct_addl_depr"))
+
+    if "tier" in mapping:
+        _ws_set(ws, mapping["tier"], summary.get("tier"))
 
     # Set start_year for table
     dps = summary.get("date_placed_in_service")
@@ -180,14 +266,13 @@ def _fill_estimator(ws: Worksheet, mapping: Dict[str, Any], result_obj: Any, mod
     else:
         start_year = min(yearly.keys()) if yearly else 2021
 
-    # Set n_years to fill up to 2052
-    last_year = 2052
+    # Set n_years to fill up to 2050
+    last_year = 2050
     n_years = last_year - start_year + 1
     mapping["table"]["start_year"] = start_year
     mapping["table"]["n_years"] = n_years
 
-    if yearly:
-        _fill_table(ws, mapping["table"], yearly)
+    _fill_table(ws, mapping["table"], yearly or {})
 
 
 def _clear_excel_errors(wb) -> None:
@@ -207,10 +292,12 @@ def write_residential_workbook(result: Any, out_path: Path | str) -> None:
     out_path = Path(out_path)
     wb = load_workbook(RES_TEMPLATE)
     ws = wb.active  # single sheet
+
     _fill_estimator(ws, RES_MAP, result, mode="residential")
 
     _clear_excel_errors(wb)   # <-- add this
 
+    ensure_logo_exact(ws)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
 
@@ -219,9 +306,11 @@ def write_commercial_workbook(result: Any, out_path: Path | str) -> None:
     out_path = Path(out_path)
     wb = load_workbook(COM_TEMPLATE)
     ws = wb.active  # single sheet
+
     _fill_estimator(ws, COM_MAP, result, mode="commercial")
 
     _clear_excel_errors(wb)   # <-- add this
 
+    ensure_logo_exact(ws)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)

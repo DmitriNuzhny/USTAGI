@@ -155,6 +155,12 @@ def macrs_rate(asset_life: str, year_index: int) -> float:
     return 0.0
 
 
+def get_bonus_rate(in_service_date: date) -> float:
+    # Simplified: assume 80% bonus for qualified property
+    # In real implementation, check if date qualifies for bonus
+    return 0.8
+
+
 @dataclass(frozen=True)
 class LookbackYearRow:
     calendar_year: int
@@ -258,3 +264,59 @@ def compute_lookback(
         net_book_value=net_book,
         year_by_year=rows,
     )
+
+
+# --- Forward schedule helpers (full-life depreciation, not just "lookback to study_year") ---
+
+def compute_full_schedule(
+    *,
+    basis: float,
+    in_service_date: date,
+    asset_kind: str,              # "building" | "5" | "7" | "15"
+    is_residential_building: bool,
+) -> Dict[int, int]:
+    """
+    Returns {calendar_year -> depreciation_amount} for the full recovery life.
+
+    IMPORTANT:
+    - For 5/7/15: first year includes BONUS + MACRS year1.
+    - For building: no bonus, uses mid-month table, full 27.5 (29 rows) or 39 (40 rows).
+    - Uses Excel-style rounding (excel_round).
+    """
+    basis_i = int(excel_round(float(basis), 0))
+    if basis_i <= 0:
+        return {}
+
+    start_year = int(in_service_date.year)
+    in_month = int(in_service_date.month)
+
+    out: Dict[int, int] = {}
+
+    if asset_kind == "building":
+        max_years = 29 if is_residential_building else 40
+        for year_index in range(1, max_years + 1):
+            cal_year = start_year + (year_index - 1)
+            rate = building_rate(year_index, in_month, is_residential_building)
+            annual = int(excel_round(basis_i * rate, 0))
+            out[cal_year] = annual
+        return out
+
+    # 5/7/15 assets
+    max_years = {"5": 6, "7": 8, "15": 16}.get(asset_kind, 0)
+    if max_years <= 0:
+        return {}
+
+    bonus_rate = get_bonus_rate(in_service_date)
+    bonus_amount = int(excel_round(basis_i * bonus_rate, 0))
+    depreciable_basis = basis_i - bonus_amount
+
+    for year_index in range(1, max_years + 1):
+        cal_year = start_year + (year_index - 1)
+        rate = macrs_rate(asset_kind, year_index)
+        macrs_amt = int(excel_round(depreciable_basis * rate, 0))
+        if year_index == 1:
+            out[cal_year] = int(bonus_amount + macrs_amt)
+        else:
+            out[cal_year] = macrs_amt
+
+    return out

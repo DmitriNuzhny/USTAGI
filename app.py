@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 # EOB engine imports
 from eob_tool.io import load_inputs
 from eob_tool.residential import compute_residential
+from eob_tool.commercial import commercial_to_estimator_payload
 from eob_tool.commercial import compute_commercial
 from eob_tool.main import load_commercial_guidelines_df
 from eob_tool.excel_writer import write_residential_workbook, write_commercial_workbook
@@ -218,7 +219,10 @@ def monday_item_to_inputs(column_values: list[dict], colid_to_title: dict[str, s
 
     basis = take("Building Basis")
     if basis:
-        out["Basis"] = basis
+        try:
+            out["Basis"] = float(basis.replace(",", "").replace("$", ""))
+        except ValueError:
+            out["Basis"] = basis
 
     # Lookback inputs (only runs if BOTH exist; calculators enforce)
     isd = take("In Service Date")
@@ -226,12 +230,19 @@ def monday_item_to_inputs(column_values: list[dict], colid_to_title: dict[str, s
     if isd:
         out["In-Service Date"] = isd
     if tax_year:
-        out["Study Tax Year"] = tax_year
+        try:
+            out["Study Tax Year"] = int(tax_year)
+        except ValueError:
+            out["Study Tax Year"] = tax_year
 
     # Residential confirmed mapping
     closed_rooms = take("Closed Room Qty")
     if closed_rooms:
         out["Bed Cnt"] = closed_rooms
+
+    tier = take("Tier")
+    if tier:
+        out["Tier"] = tier
 
     # Nice-to-have for template header if you want it later:
     addr = take("Property Address")
@@ -241,6 +252,23 @@ def monday_item_to_inputs(column_values: list[dict], colid_to_title: dict[str, s
     return out
 
 
+def normalize_inputs_for_mode(inputs: dict, mode: str) -> None:
+    """Normalize date key and ensure types."""
+    if "In-Service Date" in inputs:
+        if mode == "residential":
+            inputs["Date Placed in Service"] = inputs.pop("In-Service Date")
+        # commercial keeps "In-Service Date"
+
+    # Fallback for Study Tax Year from In-Service Date
+    if "Study Tax Year" not in inputs or not inputs.get("Study Tax Year"):
+        date_key = "Date Placed in Service" if mode == "residential" else "In-Service Date"
+        isd = inputs.get(date_key)
+        if isd and isinstance(isd, str) and len(isd) >= 4 and isd[:4].isdigit():
+            study_year = int(isd[:4])
+            inputs["Study Tax Year"] = study_year
+            print(f"[INFO] Using Study Tax Year from {date_key}: {study_year}")
+
+
 def decide_mode(inputs: dict) -> str:
     use = (inputs.get("Property Use") or "").strip().lower()
     if use in ("residential", "res"):
@@ -248,6 +276,36 @@ def decide_mode(inputs: dict) -> str:
     if use in ("commercial", "com"):
         return "commercial"
     # fallback if blank/unexpected
+    return "residential"  # default?
+
+
+def generate_excel(mode: str, field_inputs: dict, out_path: Path) -> None:
+    from eob_tool.io import load_inputs, _field_to_cell
+
+    B = load_inputs(mode, None)  # defaults
+
+    # Merge field_inputs into B
+    for k, v in field_inputs.items():
+        cell = _field_to_cell(mode, k)
+        if cell:
+            B[cell] = v
+
+    # Logging
+    date_key = "Date Placed in Service" if mode == "residential" else "In-Service Date"
+    tier = B.get("B31") if mode == "residential" else None
+    log.info(f"Normalized inputs: Basis={field_inputs.get('Basis')}, {date_key}={field_inputs.get(date_key)}, Study Tax Year={field_inputs.get('Study Tax Year')}, Tier={tier}")
+
+    if mode == "residential":
+        res = compute_residential(B)
+        log.info(f"Lookback active: {res.lookback_active}, len(yearly): {len(res.yearly)}")
+        if tier is None or tier == "":
+            log.warning("Missing Tier for residential, using default")
+        write_residential_workbook(res, out_path)
+    else:
+        guidelines_df = load_commercial_guidelines_df()
+        com = compute_commercial(B, guidelines_df)
+        log.info(f"Lookback active: {com.lookback_active}, len(yearly): {len(com.yearly)}")
+        write_commercial_workbook(com, out_path)
     return "commercial"
 
 
@@ -261,13 +319,24 @@ def generate_excel(mode: str, field_inputs: dict, out_path: Path) -> None:
         temp_json = tf.name
 
     B = load_inputs(mode, temp_json)
-
+    # Guard for critical mappings
+    if mode == "residential":
+        critical = {"basis": "B12", "in-service date": "B32", "study tax year": "B34", "tier": "B31"}
+        from eob_tool.io import _field_to_cell
+        for k, expected_cell in critical.items():
+            cell = _field_to_cell(mode, k)
+            if cell != expected_cell:
+                raise ValueError(f"Critical field '{k}' mapped to '{cell}', expected '{expected_cell}'")
+        print(f"Critical mappings: { {k: _field_to_cell(mode, k) for k in critical} }")
+        print(f"Written values: { {k: B.get(critical[k]) for k in critical} }")
     if mode == "residential":
         res_payload = compute_residential(B)
+        print(f"Summary: {res_payload['summary']}")
         write_residential_workbook(res_payload, out_path)
     else:
         guidelines_df = load_commercial_guidelines_df()
-        com_payload = compute_commercial(B, guidelines_df)
+        com = compute_commercial(B, guidelines_df)
+        com_payload = commercial_to_estimator_payload(com)
         write_commercial_workbook(com_payload, out_path)
 
 
@@ -349,6 +418,11 @@ async def export_eob_webhook(request: Request):
         col_vals = fetch_item_column_values(api_token, item_id)
         field_inputs = monday_item_to_inputs(col_vals, colid_to_title)
         mode = decide_mode(field_inputs)
+        normalize_inputs_for_mode(field_inputs, mode)
+
+        if mode == "residential" and "Tier" not in field_inputs:
+            field_inputs["Tier"] = "SFR$$"
+            log.info("[INFO] Tier missing from Monday fields, using default: 'SFR$$'")
 
         log.info(f"Field inputs: {field_inputs}")
         log.info(f"Mode: {mode}")

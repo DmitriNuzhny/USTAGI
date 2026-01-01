@@ -3,3 +3,5 @@ eob_output.xlsx
 get_group.py
 __pycache__/
 /outputs
+/scripts
+/templates

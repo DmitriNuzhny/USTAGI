@@ -36,11 +36,11 @@ def load_commercial_guidelines_df():
     from pathlib import Path
     import pandas as pd
 
-    p = Path("inputs") / "commercial_estimator_default_settings.xlsx"
+    p = Path("templates") / "commercial_estimator_default_settings.xlsx"
     if not p.exists():
         raise FileNotFoundError(
             "Missing commercial guidelines file: "
-            "inputs/commercial_estimator_default_settings.xlsx"
+            "templates/commercial_estimator_default_settings.xlsx"
         )
     return pd.read_excel(p)
 
