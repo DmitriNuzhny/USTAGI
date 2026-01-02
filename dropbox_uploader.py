@@ -117,6 +117,11 @@ class DropboxClient:
             raise DropboxError(f"get_current_account failed ({r.status_code}): {r.text[:500]}")
 
         data = r.json()
+        # Log the Dropbox account identity for debugging
+        email = data.get("email", "unknown")
+        name = (data.get("name") or {}).get("display_name", "unknown")
+        print(f"[DROPBOX_IDENTITY] email={email} name={name}")
+        
         self._root_ns = (data.get("root_info") or {}).get("root_namespace_id")
         return self._root_ns
 
