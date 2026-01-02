@@ -4,6 +4,8 @@ import time
 import logging
 import tempfile
 from pathlib import Path
+from datetime import date
+from collections import defaultdict
 
 import requests
 from dotenv import load_dotenv
@@ -17,6 +19,8 @@ from eob_tool.commercial import commercial_to_estimator_payload
 from eob_tool.commercial import compute_commercial
 from eob_tool.main import load_commercial_guidelines_df
 from eob_tool.excel_writer import write_residential_workbook, write_commercial_workbook
+
+from dropbox_uploader import upload_eob_workbook
 
 # -----------------------
 # Setup
@@ -129,6 +133,21 @@ def _monday_graphql(token: str, query: str, variables: dict) -> dict:
     return data["data"]
 
 
+def _fetch_item_name(token: str, item_id: int) -> str:
+        query = """
+        query ($item_id: [ID!]!) {
+            items(ids: $item_id) {
+                name
+            }
+        }
+        """
+        data = _monday_graphql(token, query, {"item_id": [int(item_id)]})
+        items = data.get("items") or []
+        if not items:
+                return ""
+        return items[0].get("name") or ""
+
+
 def fetch_item_column_values(token: str, item_id: int) -> list[dict]:
     query = """
     query ($item_id: [ID!]!) {
@@ -183,7 +202,7 @@ def build_colid_to_title(board_schema: dict) -> dict[str, str]:
 # -----------------------
 # Monday -> EOB input mapping (your board, v1)
 # -----------------------
-def monday_item_to_inputs(column_values: list[dict], colid_to_title: dict[str, str]) -> dict:
+def monday_item_to_inputs(column_values: list[dict], colid_to_title: dict[str, str], item_name: str | None = None) -> dict:
     """
     FIELD-keyed inputs for eob_tool.io:
       - Property Type  (from board column "Property Type")
@@ -195,18 +214,31 @@ def monday_item_to_inputs(column_values: list[dict], colid_to_title: dict[str, s
     """
     out: dict = {}
 
-    by_title: dict[str, dict] = {}
+    if item_name:
+        out["Name"] = item_name
+
+    by_title: dict[str, list[dict]] = defaultdict(list)
     for cv in column_values:
         col_id = cv.get("id")
         title = colid_to_title.get(col_id, "")
-        by_title[title.strip().lower()] = cv
+        if title:
+            by_title[title.strip().lower()].append(cv)
 
     def take(title: str) -> str | None:
-        cv = by_title.get(title.lower())
-        if not cv:
-            return None
-        txt = (cv.get("text") or "").strip()
-        return txt if txt else None
+        for cv in by_title.get(title.lower(), []):
+            txt = (cv.get("text") or "").strip()
+            if txt:
+                return txt
+            val = cv.get("value")
+            if val:
+                try:
+                    obj = json.loads(val)
+                    addr = obj.get("address") or obj.get("formatted_address")
+                    if addr and str(addr).strip():
+                        return str(addr).strip()
+                except Exception:
+                    continue
+        return None
 
     # Core fields
     prop_type = take("Property Type")
@@ -416,7 +448,8 @@ async def export_eob_webhook(request: Request):
         colid_to_title = build_colid_to_title(board)
 
         col_vals = fetch_item_column_values(api_token, item_id)
-        field_inputs = monday_item_to_inputs(col_vals, colid_to_title)
+        item_name = _fetch_item_name(api_token, item_id)
+        field_inputs = monday_item_to_inputs(col_vals, colid_to_title, item_name=item_name)
         mode = decide_mode(field_inputs)
         normalize_inputs_for_mode(field_inputs, mode)
 
@@ -427,11 +460,55 @@ async def export_eob_webhook(request: Request):
         log.info(f"Field inputs: {field_inputs}")
         log.info(f"Mode: {mode}")
 
+        def _extract_year(val):
+            if val is None:
+                return None
+            if isinstance(val, (int, float)):
+                return str(int(val))
+            s = str(val).strip()
+            if len(s) >= 4 and s[:4].isdigit():
+                return s[:4]
+            return None
+
         with tempfile.TemporaryDirectory() as td:
-            out_path = Path(td) / f"eob_{mode}_item_{item_id}.xlsx"
+            # Extract property address for filename
+            prop_addr_raw = field_inputs.get("Property Address") or "Unknown Address"
+            # Sanitize for filename (remove invalid chars)
+            prop_addr_safe = re.sub(r'[<>:"/\\|?*]', '', str(prop_addr_raw)).strip()
+            if not prop_addr_safe:
+                prop_addr_safe = "Unknown Address"
+            
+            out_path = Path(td) / f"EOB {prop_addr_safe}.xlsx"
             generate_excel(mode, field_inputs, out_path)
             file_bytes = out_path.read_bytes()
             filename = out_path.name
+
+            # Optional Dropbox upload (team-space test root with fixed structure)
+            try:
+                client_name = field_inputs.get("Name") or field_inputs.get("Client Name") or field_inputs.get("Client") or "Unknown Client"
+                prop_addr = field_inputs.get("Property Address") or "Unknown Address"
+
+                year = (
+                    _extract_year(field_inputs.get("Date Placed in Service"))
+                    or _extract_year(field_inputs.get("In-Service Date"))
+                    or _extract_year(field_inputs.get("Tax Year of CSS"))
+                    or _extract_year(field_inputs.get("Study Tax Year"))
+                    or _extract_year(field_inputs.get("Tax Year"))
+                    or str(date.today().year)
+                )
+
+                log.info(f"Dropbox attempt: client={client_name} year={year} address={prop_addr}")
+
+                upload_eob_workbook(
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    client_name=str(client_name),
+                    year=str(year),
+                    property_address=str(prop_addr),
+                    logger=log,
+                )
+            except Exception as e:
+                log.warning(f"Dropbox upload skipped/failed: {repr(e)}")
 
         _monday_upload_file_to_column(
             api_token=api_token,
